@@ -623,6 +623,8 @@ BBNET_EXPORT void bbnet_start(void) {
 }
 
 BBNET_EXPORT int bbnet_init(const BbNetHost* host) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
     if (!host || host->abi != BBNET_ABI_VERSION || !host->thread_spawn || !host->thread_join ||
         !host->thread_exit || !host->memory_is_mapped) {
         std::printf("Online: the runtime and the online module are from different versions\n");
@@ -681,6 +683,7 @@ BBNET_EXPORT int bbnet_init(const BbNetHost* host) {
     }
     std::printf("Online: %zu network and PSN functions (%s)\n", g_symbols.size(),
                 BbThd::Enabled() ? "The Hunter's Dream" : "shadNet");
+    std::fflush(stdout);
     return 0;
 }
 

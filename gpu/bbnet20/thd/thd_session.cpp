@@ -42,6 +42,7 @@ void Log(const char* format, ...) {
     std::vsnprintf(text, sizeof(text), format, args);
     va_end(args);
     std::printf("THD: %s\n", text);
+    std::fflush(stdout);
 }
 
 namespace {
@@ -146,6 +147,7 @@ std::string OnlineId() {
 }
 
 void Initialize() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     const Config& c = Cfg();
     if (SignedIn()) {
         Log("The Hunter's Dream as %s: session service %s, P2P port %d", AccountName().c_str(),
