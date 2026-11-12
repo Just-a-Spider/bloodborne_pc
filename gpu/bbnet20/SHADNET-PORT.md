@@ -21,7 +21,7 @@ service, settings) on this project's runtime. Online play is off unless `BB_ONLI
 
 `thd/` is the co-op pool for The Hunter's Dream (`online_pool=huntersdream`, which sets
 `BB_NET_BACKEND=thd`). It adapts droogie/bbhost's network side
-(https://github.com/droogie/bbhost/tree/566184a74f071166299bb656c4af479e5bbe2771):
+(https://github.com/droogie/bbhost/tree/3f9c4c05e447c8447aee60b6a4223a875187bd39, v0.2.31):
 `src/hle/net.cpp`, `src/hle/np_matching2.cpp`, `src/hle/np_signaling.cpp`, the NP parts of
 `src/hle/system.cpp`, and `src/net/{http,account,session,stun}.cpp`. These portions are
 GPL-3.0-or-later; copyright remains with the bbhost contributors. With that pool the game's NP and

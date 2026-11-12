@@ -486,6 +486,8 @@ int PeersFromMembers(const Json& members) {
             p.addr = p.local_addr;
             p.port = p.local_port;
         }
+        p.team_id = static_cast<std::uint8_t>(IntOf(m, "TeamId", 0));
+        p.flag_attr = static_cast<std::uint32_t>(IntOf(m, "FlagAttr", 0));
         PeersUpsert(p);
         ++n;
     }

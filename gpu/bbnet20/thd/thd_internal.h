@@ -86,6 +86,8 @@ struct Peer {
     std::uint16_t local_port = 0; // host order
     unsigned conn_id = 0;
     int sig_status = 0;
+    std::uint8_t team_id = 0;
+    std::uint32_t flag_attr = 0;
 };
 void PeersClear();
 void PeersUpsert(const Peer& p);
@@ -113,6 +115,26 @@ void PollerStart(std::function<void(const Json& event)> handler);
 void PollerStop();
 
 // ---- the P2P port (thd_net.cpp)
+constexpr std::size_t kMaxDatagram = 65507;
+constexpr std::uint8_t kSignalMagic[4] = {0xfe, 'b', 'b', 's'};
+
+enum SigKind : std::uint8_t {
+    kSigActivationRequest = 0x01,
+    kSigActivationAck = 0x02,
+    kSigClose = 0x03,
+    kSigEstablishedMsg = 0x04,
+    kSigOffer = 0x11,
+    kSigAccept = 0x12,
+    kSigCheck = 0x13,
+    kSigCheckAck = 0x14,
+};
+enum SigReason : std::uint8_t { kSigDeactivate = 1, kSigTerminate = 2 };
+constexpr std::size_t kSigIdLen = 16;
+constexpr std::size_t kSigFromAt = sizeof(kSignalMagic) + 2;
+constexpr std::size_t kSigToAt = kSigFromAt + kSigIdLen;
+constexpr std::size_t kSigNonceAt = kSigToAt + kSigIdLen;
+constexpr std::size_t kSigPacketLen = kSigNonceAt + 8;
+
 constexpr std::size_t kStunTokenLen = 8;
 struct Relay {
     bool present = false;
@@ -128,6 +150,8 @@ bool P2pStun(const char* host, std::uint16_t port, int timeout_ms, std::uint32_t
 // Probes from the P2P port so our NAT lets the peer in (none for a relayed peer).
 void P2pPunch(const char* label, std::uint32_t addr, std::uint16_t port, std::uint32_t local_addr,
               std::uint16_t local_port);
+// Control datagrams (kSignalMagic) between instances on the P2P port.
+void NetP2pSignal(std::uint32_t addr, std::uint16_t port, const void* data, std::size_t len);
 // The address of this machine that reaches `host` (the LAN address peers on it use).
 std::string DetectLanAddress(const std::string& host);
 
@@ -143,6 +167,16 @@ std::string NpIdText(const void* npid);
 void SignalingPeerKnown(std::uint16_t member_id);
 void SignalingPeerDead(const std::string& online_id);
 void SignalingReset();
+void SignalingControl(const std::uint8_t* data, std::size_t len, std::uint32_t addr, std::uint16_t port);
+void SignalingM2Connect(const std::string& online_id);
+int SignalingTransportStatus(const std::string& online_id);
+void SignalingM2Stop(const std::string& online_id);
+bool SignalingLive(const std::string& online_id);
+
+// ---- matching2 signaling callbacks (thd_matching2.cpp)
+void Matching2PeerClosed(const std::string& online_id);
+void Matching2TransportUp(const std::string& online_id);
+void Matching2TransportDead(const std::string& online_id, int error);
 
 void RegisterNet(Core::Loader::SymbolsResolver* sym);
 void RegisterMatching2(Core::Loader::SymbolsResolver* sym);

@@ -7,8 +7,10 @@
 #include <atomic>
 #include <cstddef>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <vector>
 
 #include "core/libraries/libs.h"
@@ -149,6 +151,9 @@ struct M2 {
     unsigned leave_req = 0;
     RequestOptParam leave_opt{};
     std::vector<std::unique_ptr<Held>> held;
+    std::map<std::string, std::pair<std::uint64_t, std::uint16_t>> dead_on_close;
+    std::set<std::uint16_t> m2_established;
+    std::set<std::uint16_t> m2_dead_sent;
 };
 M2 g;
 
@@ -221,14 +226,11 @@ std::vector<Peer> room_peers() {
     return v;
 }
 
-// ESTABLISHED for every member, self included, before the game's signaling poll.
-void schedule_established_for_all(int delay_ms) {
-    std::vector<std::uint16_t> ids;
-    for (const Peer& p : room_peers()) ids.push_back(p.member_id);
-    ids.push_back(g.member_id);
-    DispatchAfter(delay_ms, Prio::Signaling, [ids] {
-        for (std::uint16_t m : ids) fire_signaling(m, kEvSignalingEstablished, 0);
-    });
+// Matching2 signaling to every other member (never our own), as shadPS4's
+// StartMatching2: NpSignaling's transport to each, its handshake started;
+// ESTABLISHED (0x5102) for a member once that transport is up.
+void connect_signaling_for_all() {
+    for (const Peer& p : room_peers()) SignalingM2Connect(p.online_id);
 }
 // DEAD for each member first, then the room event.
 void schedule_dead(const std::vector<std::uint16_t>& ids, int error, std::uint64_t room_id, int delay_ms) {
@@ -254,12 +256,14 @@ CreateJoinRoomResponse* build_room_response(std::uint64_t room_id, std::uint16_t
     room->roomId = room_id;
     std::uint64_t joined = 0;
     std::size_t i = 0;
-    auto put = [&](std::uint16_t member_id, const std::string& online) {
+    auto put = [&](std::uint16_t member_id, const std::string& online, std::uint8_t team_id, std::uint32_t flag_attr) {
         RoomMemberDataInternal& m = members[i];
         m.next = i + 1 < n ? &members[i + 1] : nullptr;
         FillNpId(m.npId, online.c_str());
         m.memberId = member_id;
+        m.teamId = team_id;
         m.natType = 1;
+        m.flagAttr = flag_attr;
         if (member_id && member_id <= 64) joined |= 1ull << (member_id - 1);
         if (member_id == self_id) resp->members.me = &m;
         if (member_id == owner_id) {
@@ -268,8 +272,8 @@ CreateJoinRoomResponse* build_room_response(std::uint64_t room_id, std::uint16_t
         }
         ++i;
     };
-    put(self_id, OnlineId());
-    for (const Peer& p : peers) put(p.member_id, p.online_id);
+    put(self_id, OnlineId(), 0, 0);
+    for (const Peer& p : peers) put(p.member_id, p.online_id, p.team_id, p.flag_attr);
     room->joinedSlotMask = joined;
     resp->roomData = room;
     resp->members.members = members;
@@ -283,7 +287,9 @@ RoomMemberUpdateInfo* build_member_update(const Peer& p, std::uint8_t cause) {
     auto* m = reinterpret_cast<RoomMemberDataInternal*>(info + 1);
     FillNpId(m->npId, p.online_id.c_str());
     m->memberId = p.member_id;
+    m->teamId = p.team_id;
     m->natType = 1;
+    m->flagAttr = p.flag_attr;
     if (p.member_id == g.owner_id) m->flagAttr |= 0x80000000u;
     info->roomMemberDataInternal = m;
     info->eventCause = cause;
@@ -309,9 +315,10 @@ void forget_room_locked() {
     g.room_id = 0;
     g.owner_id = 0;
     g.max_slot = 0;
+    g.m2_established.clear();
+    g.m2_dead_sent.clear();
     PeersClear();
     RoomClear();
-    SignalingReset();
 }
 
 // Our LeaveRoom (or the context going away): out of the server's room, DEAD for every member,
@@ -325,7 +332,15 @@ void end_session_locked(const char* why) {
         ServerLeaveRoom(g.session_id, g.member_id, reply, err);
     }
     std::vector<std::uint16_t> ids;
-    for (const Peer& p : room_peers()) ids.push_back(p.member_id);
+    for (const Peer& p : room_peers()) {
+        if (g.m2_dead_sent.count(p.member_id)) continue;
+        if (SignalingLive(p.online_id)) {
+            g.dead_on_close[p.online_id] = {g.room_id, p.member_id};
+        } else {
+            ids.push_back(p.member_id);
+            SignalingM2Stop(p.online_id);
+        }
+    }
     schedule_dead(ids, kErrTerminatedByMyself, g.room_id, 0);
     if (g.leave_pending) {
         const unsigned req = g.leave_req;
@@ -471,10 +486,7 @@ void on_server_event(const Json& ev) {
             }
             c.run();
         });
-        DispatchAfter(800, Prio::Signaling, [mid] {
-            fire_signaling(mid, kEvSignalingEstablished, 0);
-            fire_signaling(g.member_id, kEvSignalingEstablished, 0);
-        });
+        SignalingM2Connect(p.online_id);
         return;
     }
     if (name == "room_member_left") {
@@ -491,6 +503,7 @@ void on_server_event(const Json& ev) {
         Log("np: member %u (%s) left (%s)", mid, p.online_id.c_str(), reason.c_str());
         // DEAD for that member, then MEMBER_LEFT; the room stays ours.
         schedule_dead({mid}, kErrTerminatedByPeer, g.room_id, 0);
+        g.m2_established.erase(mid);
         DispatchAfter(100, Prio::RoomEvent, [p, cause] {
             M2Call c;
             {
@@ -709,7 +722,7 @@ s32 PS4_SYSV_ABI m2_create_join_room(unsigned ctx, const std::uint8_t* reqp, con
         });
         if (!error) {
             std::lock_guard lk2(g.mu);
-            schedule_established_for_all(800);
+            connect_signaling_for_all();
         }
     });
     return 0;
@@ -764,7 +777,7 @@ s32 PS4_SYSV_ABI m2_join_room(unsigned ctx, const std::uint8_t* reqp, const Requ
         });
         if (!error) {
             std::lock_guard lk2(g.mu);
-            schedule_established_for_all(500);
+            connect_signaling_for_all();
         }
     });
     return 0;
@@ -785,14 +798,27 @@ s32 PS4_SYSV_ABI m2_leave_room(unsigned ctx, const void*, const RequestOptParam*
 }
 
 // (ctx, roomId, memberId, status*, SceNetInAddr*, SceInPort_t*)
-s32 PS4_SYSV_ABI m2_signaling_get_connection_status(unsigned ctx, std::uint64_t, std::uint16_t member, int* status,
+s32 PS4_SYSV_ABI m2_signaling_get_connection_status(unsigned ctx, std::uint64_t room, std::uint16_t member, int* status,
                                                     std::uint32_t* addr, std::uint16_t* port) {
     if (ctx != g.ctx_id) return kErrContext;
     Peer p;
-    const bool known = PeersGet(member, &p) && p.addr != 0;
-    if (status) *status = known ? 2 : 0;
-    if (addr) *addr = known ? p.addr : 0;
-    if (port) *port = known ? static_cast<std::uint16_t>((p.port << 8) | (p.port >> 8)) : 0;
+    int st = 0;
+    if (PeersGet(member, &p)) {
+        bool sent = false;
+        {
+            std::lock_guard lk(g.mu);
+            sent = g.m2_established.count(member) != 0;
+        }
+        const int transport = SignalingTransportStatus(p.online_id);
+        st = transport == 0 ? 0 : sent && transport == 2 ? 2 : 1;
+    }
+    if (status) *status = st;
+    if (addr) *addr = st == 2 ? p.addr : 0;
+    if (port) *port = st == 2 ? static_cast<std::uint16_t>((p.port << 8) | (p.port >> 8)) : 0;
+    if (Trace()) {
+        Log("sceNpMatching2SignalingGetConnectionStatus room %llu member %u -> %d",
+            static_cast<unsigned long long>(room), member, st);
+    }
     return 0;
 }
 
@@ -908,6 +934,57 @@ void RegisterMatching2(Core::Loader::SymbolsResolver* sym) {
     M2("HoqTrkS9c5Q", m2_set_room_member_data_internal);
     M2("wUmwXZHaX1w", m2_signaling_get_ping_info);
 #undef M2
+}
+
+void Matching2PeerClosed(const std::string& online_id) {
+    std::uint64_t room = 0;
+    std::uint16_t member = 0;
+    {
+        std::lock_guard lk(g.mu);
+        auto it = g.dead_on_close.find(online_id);
+        if (it == g.dead_on_close.end()) return;
+        room = it->second.first;
+        member = it->second.second;
+        g.dead_on_close.erase(it);
+    }
+    // Ahead of NpSignaling's own DEAD on the same queue.
+    DispatchAfter(0, Prio::Signaling, [room, member] { fire_signaling(member, kEvSignalingDead, kErrTerminatedByMyself, room); });
+}
+
+// The member's ESTABLISHED, once its transport has been up a second.
+void Matching2TransportUp(const std::string& online_id) {
+    std::uint16_t member = 0;
+    std::uint64_t room = 0;
+    {
+        std::lock_guard lk(g.mu);
+        if (!g.in_room) return;
+        for (const Peer& p : room_peers()) {
+            if (p.online_id == online_id) member = p.member_id;
+        }
+        if (!member || g.m2_established.count(member)) return;
+        if (SignalingTransportStatus(online_id) != 2) return;
+        g.m2_established.insert(member);
+        room = g.room_id;
+    }
+    fire_signaling(member, kEvSignalingEstablished, 0, room);
+}
+
+// The member's DEAD when its transport gave up.
+void Matching2TransportDead(const std::string& online_id, int error) {
+    std::uint16_t member = 0;
+    std::uint64_t room = 0;
+    {
+        std::lock_guard lk(g.mu);
+        if (!g.in_room) return;
+        for (const Peer& p : room_peers()) {
+            if (p.online_id == online_id) member = p.member_id;
+        }
+        if (!member || g.m2_dead_sent.count(member)) return;
+        g.m2_dead_sent.insert(member);
+        g.m2_established.erase(member);
+        room = g.room_id;
+    }
+    fire_signaling(member, kEvSignalingDead, error, room);
 }
 
 } // namespace BbThd

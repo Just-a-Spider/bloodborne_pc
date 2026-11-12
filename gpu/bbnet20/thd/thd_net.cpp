@@ -92,7 +92,11 @@ void wsa_start() {
 sockfd_t sock_udp() {
     wsa_start();
     const sockfd_t fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd != INVALID_SOCKET) sock_set_nonblock(fd, true); // blocking calls wait with WSAPoll
+    if (fd != INVALID_SOCKET) {
+        sock_set_nonblock(fd, true); // blocking calls wait with WSAPoll
+        sock_setopt_int(fd, SOL_SOCKET, SO_RCVBUF, 65536);
+        sock_setopt_int(fd, SOL_SOCKET, SO_SNDBUF, 65536);
+    }
     return fd;
 }
 void sock_setopt_int(sockfd_t fd, int level, int name, int v) {
@@ -115,7 +119,11 @@ int sock_poll(sockfd_t fd, short events, int ms) {
 }
 ssize_type sock_recvfrom(sockfd_t fd, void* buf, std::size_t len, bool dontwait, sockaddr_in* sa,
                          socklen_type* sl) {
+#ifdef MSG_TRUNC
+    return ::recvfrom(fd, buf, len, (dontwait ? MSG_DONTWAIT : 0) | MSG_TRUNC, reinterpret_cast<sockaddr*>(sa), sl);
+#else
     return ::recvfrom(fd, buf, len, dontwait ? MSG_DONTWAIT : 0, reinterpret_cast<sockaddr*>(sa), sl);
+#endif
 }
 ssize_type sock_sendto(sockfd_t fd, const void* buf, std::size_t len, bool dontwait,
                        const sockaddr_in* sa) {
@@ -123,9 +131,16 @@ ssize_type sock_sendto(sockfd_t fd, const void* buf, std::size_t len, bool dontw
                     sizeof(*sa));
 }
 void wsa_start() {}
-sockfd_t sock_udp() { return ::socket(AF_INET, SOCK_DGRAM, 0); }
 void sock_setopt_int(sockfd_t fd, int level, int name, int v) {
     ::setsockopt(fd, level, name, &v, sizeof(v));
+}
+sockfd_t sock_udp() {
+    const sockfd_t fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd != -1) {
+        sock_setopt_int(fd, SOL_SOCKET, SO_RCVBUF, 65536);
+        sock_setopt_int(fd, SOL_SOCKET, SO_SNDBUF, 65536);
+    }
+    return fd;
 }
 #endif
 bool sock_ok(sockfd_t fd) { return fd != kBadSock; }
@@ -431,14 +446,19 @@ std::size_t p2p_header(const std::uint8_t* d, std::size_t n, std::uint16_t* src,
 }
 
 void p2p_reader(std::shared_ptr<UdpPort> port) {
-    std::uint8_t buf[2048];
+    std::vector<std::uint8_t> store(kMaxDatagram);
+    std::uint8_t* const buf = store.data();
     int logs = 0;
     while (!port->stop.load(std::memory_order_relaxed)) {
         if (sock_poll(port->fd, POLLIN, 200) <= 0) continue;
         sockaddr_in sa{};
         socklen_type sl = sizeof(sa);
-        ssize_type n = sock_recvfrom(port->fd, buf, sizeof(buf), true, &sa, &sl);
+        ssize_type n = sock_recvfrom(port->fd, buf, kMaxDatagram, true, &sa, &sl);
         if (n < 0) continue;
+        if (static_cast<std::size_t>(n) > kMaxDatagram) {
+            Log("net: datagram truncated (got %zd, max %zu)", n, kMaxDatagram);
+            n = static_cast<ssize_type>(kMaxDatagram);
+        }
         if (n >= 4 && buf[0] == kRelayMagic && buf[1] == kRelayToClient && from_relay_server(sa)) {
             // A relay delivery: the owner of that relay port's datagram, known as server:port.
             const std::uint16_t from_vport = static_cast<std::uint16_t>((buf[2] << 8) | buf[3]);
@@ -449,7 +469,21 @@ void p2p_reader(std::shared_ptr<UdpPort> port) {
         std::uint16_t src = 0, dst = 0;
         const std::size_t hdr = p2p_header(buf, static_cast<std::size_t>(n), &src, &dst);
         if (!hdr) {
-            // A peer's hole-punch probe or the STUN server's answer: neither is the game's.
+            // A signaling control packet, a peer's hole-punch probe, or the STUN server's answer:
+            // none reaches a game socket.
+            if (n >= 4 && std::memcmp(buf, kSignalMagic, 4) == 0) {
+                {
+                    std::lock_guard lk(port->mu);
+                    port->heard[source_key(sa.sin_addr.s_addr, sa.sin_port)] = std::chrono::steady_clock::now();
+                }
+                std::vector<std::uint8_t> pkt(buf, buf + n);
+                const std::uint32_t from_addr = sa.sin_addr.s_addr;
+                const std::uint16_t from_port = sa.sin_port;
+                DispatchAfter(0, Prio::Signaling, [pkt, from_addr, from_port] {
+                    SignalingControl(pkt.data(), pkt.size(), from_addr, from_port);
+                });
+                continue;
+            }
             if (n >= 8 && std::memcmp(buf, kProbe, 5) == 0) {
                 std::lock_guard lk(port->mu);
                 port->heard[source_key(sa.sin_addr.s_addr, sa.sin_port)] = std::chrono::steady_clock::now();
@@ -622,7 +656,11 @@ int dgram_send(int s, const void* buf, std::uint64_t len, int flags, const SceSo
     const sockfd_t fd = sock.port ? sock.port->fd : sock.fd;
     if (!sock_ok(fd)) return static_cast<int>(len);
     if (!to) return net_err(EINVAL);
-    std::uint8_t pkt[2048];
+    // One buffer per thread, with room in front for the relay header so a
+    // relayed send needs no second copy.
+    static thread_local std::vector<std::uint8_t> store(kRelayHeader + kMaxDatagram);
+    std::uint8_t* const frame = store.data();
+    std::uint8_t* const pkt = frame + kRelayHeader;
     std::size_t hdr = 0;
     const std::uint16_t dst_vport = bswap16(to->vport);
     if (sock.p2p) {
@@ -641,7 +679,7 @@ int dgram_send(int s, const void* buf, std::uint64_t len, int flags, const SceSo
             hdr = 6;
         }
     }
-    if (hdr + len > sizeof(pkt)) return net_err(EMSGSIZE);
+    if (hdr + len > kMaxDatagram) return net_err(EMSGSIZE);
     if (buf && len) std::memcpy(pkt + hdr, buf, static_cast<std::size_t>(len));
     sockaddr_in sa{};
     sa.sin_family = AF_INET;
@@ -652,12 +690,10 @@ int dgram_send(int s, const void* buf, std::uint64_t len, int flags, const SceSo
     std::uint8_t token[kStunTokenLen];
     sockaddr_in stun_sa{};
     if (sock.p2p && relay_target(to->addr, to->port, token, &stun_sa)) {
-        std::uint8_t frame[sizeof(pkt) + kRelayHeader];
         frame[0] = kRelayMagic;
         frame[1] = kRelayToServer;
         std::memcpy(frame + 2, token, kStunTokenLen);
         std::memcpy(frame + 10, &to->port, 2); // network order is the frame's big-endian
-        std::memcpy(frame + kRelayHeader, pkt, hdr + static_cast<std::size_t>(len));
         n = sock_sendto(fd, frame, kRelayHeader + hdr + static_cast<std::size_t>(len), dontwait, &stun_sa);
         if (n >= 0) n -= static_cast<ssize_type>(kRelayHeader);
     } else {
@@ -1126,6 +1162,34 @@ bool P2pStun(const char* host, std::uint16_t sport, int timeout_ms, std::uint32_
         }
     }
     return true;
+}
+
+void NetP2pSignal(std::uint32_t addr, std::uint16_t port_host, const void* data, std::size_t len) {
+    std::shared_ptr<UdpPort> port;
+    {
+        std::lock_guard lk(g_net_mu);
+        auto it = g_p2p_ports.find(static_cast<std::uint16_t>(P2pPort()));
+        if (it != g_p2p_ports.end()) port = it->second;
+    }
+    if (!port || !addr || !port_host || len > 512) return;
+    std::uint8_t token[kStunTokenLen];
+    sockaddr_in stun_sa{};
+    const std::uint16_t port_nbo = bswap16(port_host);
+    if (relay_target(addr, port_nbo, token, &stun_sa)) {
+        std::uint8_t frame[512 + kRelayHeader];
+        frame[0] = kRelayMagic;
+        frame[1] = kRelayToServer;
+        std::memcpy(frame + 2, token, kStunTokenLen);
+        std::memcpy(frame + 10, &port_nbo, 2);
+        std::memcpy(frame + kRelayHeader, data, len);
+        (void)sock_sendto(port->fd, frame, kRelayHeader + len, true, &stun_sa);
+        return;
+    }
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = addr;
+    to.sin_port = port_nbo;
+    (void)sock_sendto(port->fd, data, len, true, &to);
 }
 
 void P2pPunch(const char* label, std::uint32_t addr, std::uint16_t port_host, std::uint32_t local_addr,
