@@ -28,6 +28,7 @@ jobs:
             mingw-w64-clang-x86_64-pkgconf
             mingw-w64-clang-x86_64-vulkan-headers
             mingw-w64-clang-x86_64-vulkan-loader
+            mingw-w64-clang-x86_64-vulkan-memory-allocator
             mingw-w64-clang-x86_64-glslang
             mingw-w64-clang-x86_64-spirv-tools
             mingw-w64-clang-x86_64-fmt
@@ -46,13 +47,17 @@ jobs:
       - name: Build C/C++ binaries (bb-probe, bbnet20)
         shell: msys2 {0}
         run: |
+          for patch in gpu/patches/fsr-vulkan/*.patch; do
+            git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch" || true
+          done
+
           cmake -S gpu -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DBB_LTO=OFF \
             -DBB_PGO=off \
             -DBB_NET=ON
           ninja -C build bb-probe bbnet20
-          clang -std=c11 -O2 -Wall -Wextra tools/gpu_capabilities.c -lvulkan-1 -lSDL3 -o build/bb-gpu-capabilities.exe
+          clang -std=c11 -O2 -Wall -Wextra $(pkg-config --cflags --libs vulkan sdl3) tools/gpu_capabilities.c -o build/bb-gpu-capabilities.exe
 
       - name: Setup .NET 9
         uses: actions/setup-dotnet@v4
@@ -87,7 +92,7 @@ jobs:
           queue=("dist/bbport-windows/bin/bb-probe.exe" "dist/bbport-windows/bin/bb-gpu-capabilities.exe")
           while ((${#queue[@]})); do
             file=${queue[0]}; queue=("${queue[@]:1}")
-            for dll in $(objdump -p "$file" | sed -n 's/^ *DLL Name: //p'); do
+            for dll in $(objdump -p "$file" | sed -n 's/^ *DLL Name: //p' | tr -d '\r'); do
               key=${dll,,}
               [[ -n ${seen[$key]:-} ]] && continue
               seen[$key]=1
@@ -102,7 +107,7 @@ jobs:
           queue=("dist/bbport-windows/online/bbnet20.dll")
           while ((${#queue[@]})); do
             file=${queue[0]}; queue=("${queue[@]:1}")
-            for dll in $(objdump -p "$file" | sed -n 's/^ *DLL Name: //p'); do
+            for dll in $(objdump -p "$file" | sed -n 's/^ *DLL Name: //p' | tr -d '\r'); do
               key=${dll,,}
               [[ -n ${seen[$key]:-} || $key == "bb-probe.exe" || $key == "vulkan-1.dll" ]] && continue
               seen[$key]=1
