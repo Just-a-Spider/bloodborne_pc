@@ -76,7 +76,7 @@ jobs:
       - name: Build Game Runner (bbport-run.exe)
         run: |
           pip install pyinstaller
-          pyinstaller --noconfirm --clean --log-level WARN --console --name bbport-run --icon packaging/bbport.ico --paths . --paths ./scripts --hidden-import run launcher/bbport_launcher_win.py
+          pyinstaller --noconfirm --clean --log-level WARN --console --name bbport-run --icon packaging/bbport.ico --paths . --paths ./scripts --hidden-import run --hidden-import argparse --hidden-import base64 --hidden-import bisect --hidden-import collections --hidden-import contextlib --hidden-import glob --hidden-import hashlib --hidden-import json --hidden-import math --hidden-import re --hidden-import shutil --hidden-import struct --hidden-import tempfile --hidden-import zlib --hidden-import io --hidden-import runpy --hidden-import xml.etree.ElementTree --hidden-import ctypes.wintypes --hidden-import socket --hidden-import urllib.request --hidden-import urllib.error --hidden-import http.server --hidden-import socketserver --hidden-import secrets --hidden-import uuid --hidden-import traceback --hidden-import datetime --hidden-import threading launcher/bbport_launcher_win.py
 
       - name: Stage Packages and Collect DLLs
         shell: msys2 {0}
