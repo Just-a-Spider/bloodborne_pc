@@ -89,6 +89,9 @@ void wsa_start() {
     }();
     (void)started;
 }
+void sock_setopt_int(sockfd_t fd, int level, int name, int v) {
+    ::setsockopt(fd, level, name, reinterpret_cast<const char*>(&v), sizeof(v));
+}
 sockfd_t sock_udp() {
     wsa_start();
     const sockfd_t fd = ::socket(AF_INET, SOCK_DGRAM, 0);
@@ -98,9 +101,6 @@ sockfd_t sock_udp() {
         sock_setopt_int(fd, SOL_SOCKET, SO_SNDBUF, 65536);
     }
     return fd;
-}
-void sock_setopt_int(sockfd_t fd, int level, int name, int v) {
-    ::setsockopt(fd, level, name, reinterpret_cast<const char*>(&v), sizeof(v));
 }
 #else
 using sockfd_t = int;
@@ -456,7 +456,7 @@ void p2p_reader(std::shared_ptr<UdpPort> port) {
         ssize_type n = sock_recvfrom(port->fd, buf, kMaxDatagram, true, &sa, &sl);
         if (n < 0) continue;
         if (static_cast<std::size_t>(n) > kMaxDatagram) {
-            Log("net: datagram truncated (got %zd, max %zu)", n, kMaxDatagram);
+            Log("net: datagram truncated (got %lld, max %zu)", static_cast<long long>(n), kMaxDatagram);
             n = static_cast<ssize_type>(kMaxDatagram);
         }
         if (n >= 4 && buf[0] == kRelayMagic && buf[1] == kRelayToClient && from_relay_server(sa)) {
