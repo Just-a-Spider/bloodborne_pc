@@ -1,0 +1,143 @@
+name: Windows Build
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            git
+            mingw-w64-clang-x86_64-toolchain
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-pkgconf
+            mingw-w64-clang-x86_64-vulkan-headers
+            mingw-w64-clang-x86_64-vulkan-loader
+            mingw-w64-clang-x86_64-glslang
+            mingw-w64-clang-x86_64-spirv-tools
+            mingw-w64-clang-x86_64-fmt
+            mingw-w64-clang-x86_64-boost
+            mingw-w64-clang-x86_64-robin-map
+            mingw-w64-clang-x86_64-xxhash
+            mingw-w64-clang-x86_64-sdl3
+            mingw-w64-clang-x86_64-ffmpeg
+            mingw-w64-clang-x86_64-zydis
+            mingw-w64-clang-x86_64-protobuf
+            mingw-w64-clang-x86_64-nlohmann-json
+            mingw-w64-clang-x86_64-openssl
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-miniupnpc
+
+      - name: Build C/C++ binaries (bb-probe, bbnet20)
+        shell: msys2 {0}
+        run: |
+          cmake -S gpu -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBB_LTO=OFF \
+            -DBB_PGO=off \
+            -DBB_NET=ON
+          ninja -C build bb-probe bbnet20
+          clang -std=c11 -O2 -Wall -Wextra tools/gpu_capabilities.c -lvulkan-1 -lSDL3 -o build/bb-gpu-capabilities.exe
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Build Launcher (Bloodborne.exe)
+        run: |
+          dotnet publish launcher/windows -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -p:DebugType=none -o dist/launcher
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build Game Runner (bbport-run.exe)
+        run: |
+          pip install pyinstaller
+          pyinstaller --noconfirm --clean --log-level WARN --console --name bbport-run --icon packaging/bbport.ico --paths . --paths ./scripts --hidden-import run launcher/bbport_launcher_win.py
+
+      - name: Stage Packages and Collect DLLs
+        shell: msys2 {0}
+        run: |
+          mkdir -p dist/bbport-windows/bin dist/bbport-windows/online dist/bbport-windows/scripts dist/bbport-windows/patches dist/bbnet20-windows/online
+
+          llvm-strip --strip-debug -o dist/bbport-windows/bin/bb-probe.exe build/bb-probe.exe
+          llvm-strip --strip-debug -o dist/bbport-windows/bin/bb-gpu-capabilities.exe build/bb-gpu-capabilities.exe
+          llvm-strip --strip-debug -o dist/bbport-windows/online/bbnet20.dll build/bbnet20.dll
+          cp dist/bbport-windows/online/bbnet20.dll dist/bbnet20-windows/online/
+
+          declare -A seen
+          queue=("dist/bbport-windows/bin/bb-probe.exe" "dist/bbport-windows/bin/bb-gpu-capabilities.exe")
+          while ((${#queue[@]})); do
+            file=${queue[0]}; queue=("${queue[@]:1}")
+            for dll in $(objdump -p "$file" | sed -n 's/^ *DLL Name: //p'); do
+              key=${dll,,}
+              [[ -n ${seen[$key]:-} ]] && continue
+              seen[$key]=1
+              found=$(find /clang64/bin -maxdepth 1 -iname "$dll" -print -quit)
+              if [[ -n $found && $key != "vulkan-1.dll" ]]; then
+                cp "$found" dist/bbport-windows/bin/
+                queue+=("$found")
+              fi
+            done
+          done
+
+          queue=("dist/bbport-windows/online/bbnet20.dll")
+          while ((${#queue[@]})); do
+            file=${queue[0]}; queue=("${queue[@]:1}")
+            for dll in $(objdump -p "$file" | sed -n 's/^ *DLL Name: //p'); do
+              key=${dll,,}
+              [[ -n ${seen[$key]:-} || $key == "bb-probe.exe" || $key == "vulkan-1.dll" ]] && continue
+              seen[$key]=1
+              found=$(find /clang64/bin -maxdepth 1 -iname "$dll" -print -quit)
+              if [[ -n $found ]]; then
+                cp "$found" dist/bbport-windows/online/
+                cp "$found" dist/bbnet20-windows/online/
+                queue+=("$found")
+              fi
+            done
+          done
+
+          cp dist/launcher/Bloodborne.exe dist/bbport-windows/
+          cp -r dist/bbport-run/* dist/bbport-windows/
+
+          cp scripts/*.py dist/bbport-windows/scripts/
+          mkdir -p dist/bbport-windows/scripts/bbsc_gameserver
+          cp scripts/bbsc_gameserver/* dist/bbport-windows/scripts/bbsc_gameserver/ 2>/dev/null || true
+          cp -r patches dist/bbport-windows/
+          cp run.py LICENSE NOTICE VERSION packaging/windows/README-Windows.txt dist/bbport-windows/
+
+      - name: Compress Archives
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/bbport-windows/* -DestinationPath dist/bbport-windows-full.zip
+          Compress-Archive -Path dist/bbnet20-windows/* -DestinationPath dist/bbnet20-windows-dropin.zip
+
+      - name: Upload Full Windows Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: bbport-windows-full
+          path: dist/bbport-windows-full.zip
+
+      - name: Upload Online Module Dropin Only
+        uses: actions/upload-artifact@v4
+        with:
+          name: bbnet20-windows-dropin
+          path: dist/bbnet20-windows-dropin.zip
